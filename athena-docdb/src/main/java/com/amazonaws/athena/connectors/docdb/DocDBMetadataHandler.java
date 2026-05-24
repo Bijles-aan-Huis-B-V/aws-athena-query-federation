@@ -110,7 +110,9 @@ public class DocDBMetadataHandler
     //Used to filter out Glue tables which lack a docdb metadata flag.
     private static final TableFilter TABLE_FILTER = (Table table) -> table.parameters().containsKey(DOCDB_METADATA_FLAG);
     //The number of documents to scan when attempting to infer schema from an DocDB collection.
-    private static final int SCHEMA_INFERRENCE_NUM_DOCS = 10;
+    // BAH fork: raised from 10 to 3000 to make schema inference deterministic
+    // and avoid empty-struct TYPE_NOT_FOUND failures from unlucky sampling.
+    private static final int SCHEMA_INFERRENCE_NUM_DOCS = 3000;
     // used to filter out Glue databases which lack the docdb-metadata-flag in the URI.
     private static final DatabaseFilter DB_FILTER = (Database database) -> (database.locationUri() != null && database.locationUri().contains(DOCDB_METADATA_FLAG));
 
