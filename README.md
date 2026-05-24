@@ -1,5 +1,7 @@
 # Amazon Athena Query Federation
 
+> ⚠️ **This is the Bijles-aan-Huis fork.** The `bah-fork` branch carries two small patches to the `athena-docdb` connector (schema-inference sample size 10→3000 + empty-struct → VARCHAR fallback) needed for our production DocumentDB use. See [**BAH-FORK.md**](./BAH-FORK.md) for why we forked, branch model, build / deploy workflow, and rebase recipe. The rest of this README is the unmodified upstream documentation.
+
 [![Build Status](https://github.com/awslabs/aws-athena-query-federation/workflows/Java%20CI%20Push/badge.svg)](https://github.com/awslabs/aws-athena-query-federation/actions)
 [![codecov](https://codecov.io/github/awslabs/aws-athena-query-federation/graph/badge.svg?token=x5Q7jg0yUy)](https://codecov.io/github/awslabs/aws-athena-query-federation)
 

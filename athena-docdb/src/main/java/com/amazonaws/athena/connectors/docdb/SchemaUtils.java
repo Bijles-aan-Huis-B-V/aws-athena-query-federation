@@ -114,11 +114,58 @@ public class SchemaUtils
                 throw new RuntimeException("No columns found after scanning " + fieldCount + " values across " +
                         docCount + " documents. Please ensure the collection is not empty and contains at least 1 supported column type.");
             }
-            return schema;
+            // BAH fork: belt-and-suspenders pass — any STRUCT that ended up with no children
+            // (e.g. produced via mergeStructField from two empty parents) is rewritten to VARCHAR
+            // so Athena engine v3 never sees "Unknown type: row".
+            return sanitizeEmptyStructs(schema);
         }
         finally {
             logger.info("inferSchema: Evaluated {} field values across {} documents.", fieldCount, docCount);
         }
+    }
+
+    /**
+     * BAH fork: walks the inferred schema and replaces any STRUCT field that has no children
+     * (an "empty row" type) with a VARCHAR field of the same name. Athena engine v3 rejects empty
+     * struct types with "TYPE_NOT_FOUND: Unknown type: row" at query-planning time, which used to
+     * break every SELECT against an affected collection. After this pass, the worst case becomes a
+     * VARCHAR column the user can still inspect (typically empty / null).
+     */
+    private static Schema sanitizeEmptyStructs(Schema schema)
+    {
+        SchemaBuilder sb = SchemaBuilder.newBuilder();
+        for (Field f : schema.getFields()) {
+            sb.addField(sanitizeFieldEmptyStructs(f));
+        }
+        return sb.build();
+    }
+
+    private static Field sanitizeFieldEmptyStructs(Field field)
+    {
+        Types.MinorType type = Types.getMinorTypeForArrowType(field.getType());
+        if (type == Types.MinorType.STRUCT) {
+            List<Field> children = field.getChildren();
+            if (children == null || children.isEmpty()) {
+                logger.warn("sanitizeEmptyStructs: empty STRUCT field[{}] rewritten to VARCHAR.", field.getName());
+                return new Field(field.getName(), FieldType.nullable(Types.MinorType.VARCHAR.getType()), null);
+            }
+            List<Field> rebuilt = new ArrayList<>();
+            for (Field child : children) {
+                rebuilt.add(sanitizeFieldEmptyStructs(child));
+            }
+            return new Field(field.getName(), field.getFieldType(), rebuilt);
+        }
+        if (type == Types.MinorType.LIST) {
+            List<Field> children = field.getChildren();
+            if (children != null && !children.isEmpty()) {
+                List<Field> rebuilt = new ArrayList<>();
+                for (Field child : children) {
+                    rebuilt.add(sanitizeFieldEmptyStructs(child));
+                }
+                return new Field(field.getName(), field.getFieldType(), rebuilt);
+            }
+        }
+        return field;
     }
 
     /**
@@ -243,8 +290,16 @@ public class SchemaUtils
                     Collections.singletonList(child));
         }
         else if (value instanceof Document) {
-            List<Field> children = new ArrayList<>();
             Document doc = (Document) value;
+            // BAH fork: an empty sub-document (`{}`) would otherwise produce a STRUCT
+            // with no children, which Athena engine v3 rejects with "TYPE_NOT_FOUND: Unknown type: row".
+            // Downgrade to VARCHAR so the field is still queryable (as JSON string) instead of breaking
+            // every SELECT against this collection.
+            if (doc.isEmpty()) {
+                logger.warn("getArrowField: Encountered empty sub-document for field[{}], defaulting to VARCHAR to avoid empty-struct schema.", key);
+                return new Field(key, FieldType.nullable(Types.MinorType.VARCHAR.getType()), null);
+            }
+            List<Field> children = new ArrayList<>();
             for (String childKey : doc.keySet()) {
                 Object childVal = doc.get(childKey);
                 Field child = getArrowField(childKey, childVal);
