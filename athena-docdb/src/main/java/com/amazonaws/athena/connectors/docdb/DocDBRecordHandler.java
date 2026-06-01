@@ -215,50 +215,57 @@ public class DocDBRecordHandler
         //Then Apply Limit if it exists
         limit.ifPresent(findIterable::limit);
 
-        final MongoCursor<Document> iterable = findIterable.batchSize(MONGO_QUERY_BATCH_SIZE).iterator();
         final boolean disableProjectionAndCasing = getDisableProjectionAndCasing();
 
         long numRows = 0;
         final AtomicLong numResultRows = new AtomicLong(0);
-        while (iterable.hasNext() && queryStatusChecker.isQueryRunning()) {
-            if (limit.isPresent()) {
-                int l = limit.get();
-                if (numRows >= l) {
-                    logger.info("Reached configured limit of {} rows, stopping iteration", l);
-                    break;
+        // BAH fork: wrap the cursor in try-with-resources so it is always closed when the
+        // query finishes (normally, on exception, or on a cancelled query). Upstream leaves
+        // the cursor open and relies on the server-side cursor timeout (~10 min) to reclaim
+        // it. On a small DocumentDB instance (t3.medium has a hard limit of only 30 open
+        // cursors) a burst of queries exhausts the limit and the engine starts rejecting new
+        // queries with "Cannot open a new cursor since too many cursors are already opened".
+        try (MongoCursor<Document> iterable = findIterable.batchSize(MONGO_QUERY_BATCH_SIZE).iterator()) {
+            while (iterable.hasNext() && queryStatusChecker.isQueryRunning()) {
+                if (limit.isPresent()) {
+                    int l = limit.get();
+                    if (numRows >= l) {
+                        logger.info("Reached configured limit of {} rows, stopping iteration", l);
+                        break;
+                    }
                 }
+                numRows++;
+
+                spiller.writeRows((Block block, int rowNum) -> {
+                    final Map<String, Object> doc = documentAsMap(iterable.next(), disableProjectionAndCasing);
+                    boolean matched = true;
+
+                    for (final Field nextField : recordsRequest.getSchema().getFields()) {
+                        final Object value = TypeUtils.coerce(nextField, doc.get(nextField.getName()));
+                        final Types.MinorType fieldType = Types.getMinorTypeForArrowType(nextField.getType());
+                        try {
+                            switch (fieldType) {
+                                case LIST:
+                                case STRUCT:
+                                    matched &= block.offerComplexValue(nextField.getName(), rowNum, DEFAULT_FIELD_RESOLVER, value);
+                                    break;
+                                default:
+                                    matched &= block.offerValue(nextField.getName(), rowNum, value);
+                                    break;
+                            }
+                            if (!matched) {
+                                return 0;
+                            }
+                        }
+                        catch (Exception ex) {
+                            throw new RuntimeException("Error while processing field " + nextField.getName(), ex);
+                        }
+                    }
+
+                    numResultRows.getAndIncrement();
+                    return 1;
+                });
             }
-            numRows++;
-
-            spiller.writeRows((Block block, int rowNum) -> {
-                final Map<String, Object> doc = documentAsMap(iterable.next(), disableProjectionAndCasing);
-                boolean matched = true;
-
-                for (final Field nextField : recordsRequest.getSchema().getFields()) {
-                    final Object value = TypeUtils.coerce(nextField, doc.get(nextField.getName()));
-                    final Types.MinorType fieldType = Types.getMinorTypeForArrowType(nextField.getType());
-                    try {
-                        switch (fieldType) {
-                            case LIST:
-                            case STRUCT:
-                                matched &= block.offerComplexValue(nextField.getName(), rowNum, DEFAULT_FIELD_RESOLVER, value);
-                                break;
-                            default:
-                                matched &= block.offerValue(nextField.getName(), rowNum, value);
-                                break;
-                        }
-                        if (!matched) {
-                            return 0;
-                        }
-                    }
-                    catch (Exception ex) {
-                        throw new RuntimeException("Error while processing field " + nextField.getName(), ex);
-                    }
-                }
-
-                numResultRows.getAndIncrement();
-                return 1;
-            });
         }
 
         logger.info("readWithConstraint: numRows[{}] numResultRows[{}]", numRows, numResultRows.get());
