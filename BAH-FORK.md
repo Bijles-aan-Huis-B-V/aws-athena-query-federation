@@ -6,19 +6,29 @@ This is the Bijles-aan-Huis fork of [awslabs/aws-athena-query-federation](https:
 
 We use the `athena-docdb` connector to query our production DocumentDB cluster from Athena. The upstream connector samples **10 documents** per cold start to infer Arrow schemas (the constant `SCHEMA_INFERRENCE_NUM_DOCS` in `DocDBMetadataHandler.java`, no env var override). Because MongoDB is schemaless, that small sample is non-deterministic across cold starts. We periodically hit `TYPE_NOT_FOUND: Unknown type: row` at query-planning time when the sample happened to include sub-documents that were present but empty (`{}`), which the connector then emitted as `struct<>` — a row type with no children that Athena engine v3 rejects.
 
-The first two knobs (sample size, empty-struct emission) plus a cursor leak are all upstream issues. We considered a daily Glue-sync Lambda or a single-column JSON projection in Glue for the schema problems; both moved the moving parts elsewhere without removing them. A tiny fork was the simpler answer.
+These are all cases where upstream's defaults don't fit School Talent's data model (schemaless sampling, empty sub-documents, a cursor leak, and numeric `_id`s). We considered a daily Glue-sync Lambda or a single-column JSON projection in Glue for the schema problems; both moved the moving parts elsewhere without removing them. A tiny fork was the simpler answer.
 
 ## What we changed
 
-Three commits on the [`bah-fork`](https://github.com/Bijles-aan-Huis-B-V/aws-athena-query-federation/tree/bah-fork) branch, all touching `athena-docdb/`:
+Four commits on the [`bah-fork`](https://github.com/Bijles-aan-Huis-B-V/aws-athena-query-federation/tree/bah-fork) branch, all touching `athena-docdb/`:
 
 | Commit | Files | Change |
 |---|---|---|
 | `docdb: bump schema-inference sample size from 10 to 3000` | `DocDBMetadataHandler.java` | Constant bump. 3000 docs → schema becomes effectively deterministic. Cold-start adds ~2-5 s for the first query against a collection; warm queries unaffected. |
 | `docdb: downgrade empty struct fields to VARCHAR` | `SchemaUtils.java` | Root-cause fix: when `getArrowField` sees an empty `Document`, emit VARCHAR instead of empty STRUCT. Plus a defensive walk over the built schema rewriting any residual `struct<>` to VARCHAR. |
 | `docdb: close the Mongo cursor after each read` | `DocDBRecordHandler.java` | Wrap the query cursor in try-with-resources so it is closed when the query finishes. Upstream leaks the cursor and relies on the server-side ~10-min timeout to reclaim it; on a t3.medium DocumentDB instance (hard limit of **30** open cursors) a burst of analytics queries exhausts the limit and the engine rejects new queries with `Cannot open a new cursor since too many cursors are already opened`. |
+| `docdb: only coerce _id filter values to ObjectId when actually an ObjectId` | `QueryUtils.java` | Upstream wraps **every** `_id` filter value in `new ObjectId(...)`, assuming all `_id`s are 24-char hex ObjectIds. Our app writes numeric (Long) ids into `_id`, so `WHERE _id = 1514` threw `invalid hexadecimal representation of an ObjectId: [1514]`. Added `coerceIdValue()` — convert to ObjectId only when `ObjectId.isValid()` is true, else pass the raw value through. Applied at all five `_id` conversion sites (eq, IN, NOT_IN, plan-based eq, plan-based $in/$nin). Reading `_id` always worked (surfaces as bigint); only filter pushdown was broken. |
 
 No SDK changes, no behaviour change for fields whose sub-shape is discoverable in the sample.
+
+### Connector-adjacent fixes that live outside this fork
+
+Two related issues were fixed in infrastructure config, not in connector code (documented here so the full picture is in one place):
+
+- **Connection-pool bounds** — the Lambda's DocumentDB connection string carries `maxPoolSize=10&maxIdleTimeMS=60000&maxConnecting=2&waitQueueTimeoutMS=10000` so idle connections (and their reserved cursor slots) are released promptly instead of lingering across warm invocations.
+- **Reserved concurrency = 12** — Athena fans one federated query into many parallel split invocations (observed 47-77 at once), each opening a cursor; capping concurrency keeps worst-case concurrent cursors under the t3.medium limit of 30.
+
+Both live in `infra/.../athena-prod-federated-query-v2/lambda-mongo/`. If the DocumentDB instance is ever scaled up (e.g. r5.large = 450 cursors), the concurrency cap can be raised or removed.
 
 ## Branch model
 
