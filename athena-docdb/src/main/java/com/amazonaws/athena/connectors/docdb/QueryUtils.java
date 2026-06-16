@@ -107,6 +107,31 @@ public final class QueryUtils
     }
 
     /**
+     * BAH fork: coerce a filter value for the {@code _id} column.
+     *
+     * Upstream unconditionally wraps any {@code _id} predicate value in {@code new ObjectId(...)},
+     * assuming every MongoDB {@code _id} is a 24-char hex ObjectId. That assumption is false for
+     * School Talent: our application writes its own numeric (Long) ids into {@code _id}. A query like
+     * {@code WHERE _id = 1514} then throws "invalid hexadecimal representation of an ObjectId: [1514]"
+     * because "1514" is not a valid ObjectId.
+     *
+     * This helper keeps both worlds working: if the value looks like a real ObjectId
+     * ({@link ObjectId#isValid}) we convert it; otherwise we pass the raw value through so MongoDB
+     * matches it natively (numeric {@code _id} stays numeric, string {@code _id} stays string).
+     */
+    private static Object coerceIdValue(Object value)
+    {
+        if (value == null) {
+            return null;
+        }
+        String asString = value.toString();
+        if (ObjectId.isValid(asString)) {
+            return new ObjectId(asString);
+        }
+        return value;
+    }
+
+    /**
      * Given a Schema create a projection document which can be used to request only specific Document fields
      * from DocumentDB.
      *
@@ -231,8 +256,7 @@ public final class QueryUtils
         if (singleValues.size() == 1) {
             Object value = singleValues.get(0);
             if (name.equals(COLUMN_NAME_ID)) {
-                ObjectId objectId = new ObjectId(value.toString());
-                disjuncts.add(documentOf(EQ_OP, objectId));
+                disjuncts.add(documentOf(EQ_OP, coerceIdValue(value)));
             }
             else {
                 disjuncts.add(documentOf(EQ_OP, value));
@@ -240,10 +264,10 @@ public final class QueryUtils
         }
         else if (singleValues.size() > 1) {
             if (name.equals(COLUMN_NAME_ID)) {
-                List<ObjectId> objectIdList = singleValues.stream()
-                        .map(obj -> new ObjectId(obj.toString()))
+                List<Object> idList = singleValues.stream()
+                        .map(QueryUtils::coerceIdValue)
                         .collect(Collectors.toList());
-                disjuncts.add(documentOf(IN_OP, objectIdList));
+                disjuncts.add(documentOf(IN_OP, idList));
             }
             else {
                 disjuncts.add(documentOf(IN_OP, singleValues));
@@ -446,10 +470,10 @@ public final class QueryUtils
             if (!notInValues.isEmpty()) {
                 Document notInPredicate;
                 if (column.equals(COLUMN_NAME_ID)) {
-                    List<ObjectId> objectIdList = notInValues.stream()
-                            .map(v -> new ObjectId(v.toString()))
+                    List<Object> idList = notInValues.stream()
+                            .map(QueryUtils::coerceIdValue)
                             .collect(Collectors.toList());
-                    notInPredicate = new Document(NOTIN_OP, objectIdList);
+                    notInPredicate = new Document(NOTIN_OP, idList);
                 }
                 else {
                     notInPredicate = new Document(NOTIN_OP, notInValues);
@@ -530,7 +554,7 @@ public final class QueryUtils
             Object eqValue = equalValues.get(0);
             Document equalPredicate;
             if (column.equals(COLUMN_NAME_ID)) {
-                equalPredicate = new Document(EQ_OP, new ObjectId(eqValue.toString()));
+                equalPredicate = new Document(EQ_OP, coerceIdValue(eqValue));
             }
             else {
                 equalPredicate = new Document(EQ_OP, eqValue);
@@ -552,10 +576,10 @@ public final class QueryUtils
     private static Document buildValueListPredicate(String column, String operator, List<Object> values)
     {
         if (column.equals(COLUMN_NAME_ID)) {
-            List<ObjectId> objectIdList = values.stream()
-                    .map(v -> new ObjectId(v.toString()))
+            List<Object> idList = values.stream()
+                    .map(QueryUtils::coerceIdValue)
                     .collect(Collectors.toList());
-            return new Document(operator, objectIdList);
+            return new Document(operator, idList);
         }
         return new Document(operator, values);
     }
