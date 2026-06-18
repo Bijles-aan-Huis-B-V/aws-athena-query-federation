@@ -291,14 +291,16 @@ public class SchemaUtils
         }
         else if (value instanceof Document) {
             Document doc = (Document) value;
-            // BAH fork: an empty sub-document (`{}`) would otherwise produce a STRUCT
-            // with no children, which Athena engine v3 rejects with "TYPE_NOT_FOUND: Unknown type: row".
-            // Downgrade to VARCHAR so the field is still queryable (as JSON string) instead of breaking
-            // every SELECT against this collection.
-            if (doc.isEmpty()) {
-                logger.warn("getArrowField: Encountered empty sub-document for field[{}], defaulting to VARCHAR to avoid empty-struct schema.", key);
-                return new Field(key, FieldType.nullable(Types.MinorType.VARCHAR.getType()), null);
-            }
+            // BAH fork: an empty sub-document (`{}`) is returned as an empty STRUCT (no children),
+            // NOT downgraded to VARCHAR here. This matters for fields that are empty in some
+            // documents and populated in others (e.g. personal_info.location.coordinates, empty for
+            // ~3200 users without an address but {latitude, longitude} for the rest). Downgrading the
+            // empty case to VARCHAR would make it collide with the populated STRUCT during the schema
+            // union and the whole column would degrade to a string, so `.latitude`/`.longitude` access
+            // would break. Leaving it as an empty STRUCT lets mergeStructField() union it with the
+            // populated occurrences and keep the real {latitude, longitude} shape.
+            // The TYPE_NOT_FOUND safeguard for fields that are empty across the ENTIRE sample is still
+            // handled centrally by sanitizeEmptyStructs() after the union completes.
             List<Field> children = new ArrayList<>();
             for (String childKey : doc.keySet()) {
                 Object childVal = doc.get(childKey);
