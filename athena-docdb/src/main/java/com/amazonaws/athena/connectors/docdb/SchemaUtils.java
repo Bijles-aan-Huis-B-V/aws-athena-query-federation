@@ -180,14 +180,37 @@ public class SchemaUtils
     private static Field mergeListField(String fieldName, Field curParentField, Field newParentField)
     {
         //Apache Arrow lists have a special child that holds the concrete type of the list.
-        Types.MinorType newInnerType = Types.getMinorTypeForArrowType(curParentField.getChildren().get(0).getType());
-        Types.MinorType curInnerType = Types.getMinorTypeForArrowType(newParentField.getChildren().get(0).getType());
-        if (newInnerType == Types.MinorType.LIST && curInnerType == Types.MinorType.LIST) {
+        Field curInner = curParentField.getChildren().get(0);
+        Field newInner = newParentField.getChildren().get(0);
+        Types.MinorType curInnerType = Types.getMinorTypeForArrowType(curInner.getType());
+        Types.MinorType newInnerType = Types.getMinorTypeForArrowType(newInner.getType());
+
+        if (curInnerType == Types.MinorType.LIST && newInnerType == Types.MinorType.LIST) {
             return FieldBuilder.newBuilder(fieldName, Types.MinorType.LIST.getType())
-                    .addField(mergeStructField("", curParentField.getChildren().get(0), newParentField.getChildren().get(0))).build();
+                    .addField(mergeStructField("", curInner, newInner)).build();
+        }
+        // BAH fork: both elements are STRUCT — union their children so the list element keeps
+        // every field seen across documents. Upstream kept only the first occurrence, silently
+        // dropping fields that appear only in later documents (e.g. an optional school_year_id
+        // in tutor.course_offerings).
+        else if (curInnerType == Types.MinorType.STRUCT && newInnerType == Types.MinorType.STRUCT) {
+            return FieldBuilder.newBuilder(fieldName, Types.MinorType.LIST.getType())
+                    .addField(mergeStructField("", curInner, newInner)).build();
         }
         else if (curInnerType != newInnerType) {
-            //TODO: currently we resolve fields with mixed types by defaulting to VARCHAR. This is _not_ ideal
+            // BAH fork: a list that is EMPTY in some documents infers as LIST<VARCHAR> (the type
+            // erasure default in getArrowField) and then collides here with the real element type
+            // from populated documents. When the real element is a STRUCT — i.e. an array of
+            // sub-documents such as tutor.course_offerings — keep the STRUCT instead of degrading
+            // the whole column to a string. Degrading made the object array unreadable: it
+            // surfaced as array<varchar> whose elements all came back null.
+            if (curInnerType == Types.MinorType.STRUCT) {
+                return curParentField;
+            }
+            if (newInnerType == Types.MinorType.STRUCT) {
+                return newParentField;
+            }
+            //TODO: genuinely mixed scalar element types still default to VARCHAR (unchanged).
             logger.warn("mergeListField: Encountered a mixed-type list field[{}] {} vs {}, defaulting to String.",
                     fieldName, curInnerType, newInnerType);
             return FieldBuilder.newBuilder(fieldName, Types.MinorType.LIST.getType()).addStringField("").build();
