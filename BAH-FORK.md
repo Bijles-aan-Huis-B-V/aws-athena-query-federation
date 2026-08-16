@@ -10,7 +10,7 @@ These are all cases where upstream's defaults don't fit School Talent's data mod
 
 ## What we changed
 
-Four commits on the [`bah-fork`](https://github.com/Bijles-aan-Huis-B-V/aws-athena-query-federation/tree/bah-fork) branch, all touching `athena-docdb/`:
+Seven commits on the [`bah-fork`](https://github.com/Bijles-aan-Huis-B-V/aws-athena-query-federation/tree/bah-fork) branch, all touching `athena-docdb/`:
 
 | Commit | Files | Change |
 |---|---|---|
@@ -18,8 +18,33 @@ Four commits on the [`bah-fork`](https://github.com/Bijles-aan-Huis-B-V/aws-athe
 | `docdb: downgrade empty struct fields to VARCHAR` | `SchemaUtils.java` | Root-cause fix: when `getArrowField` sees an empty `Document`, emit VARCHAR instead of empty STRUCT. Plus a defensive walk over the built schema rewriting any residual `struct<>` to VARCHAR. |
 | `docdb: close the Mongo cursor after each read` | `DocDBRecordHandler.java` | Wrap the query cursor in try-with-resources so it is closed when the query finishes. Upstream leaks the cursor and relies on the server-side ~10-min timeout to reclaim it; on a t3.medium DocumentDB instance (hard limit of **30** open cursors) a burst of analytics queries exhausts the limit and the engine rejects new queries with `Cannot open a new cursor since too many cursors are already opened`. |
 | `docdb: only coerce _id filter values to ObjectId when actually an ObjectId` | `QueryUtils.java` | Upstream wraps **every** `_id` filter value in `new ObjectId(...)`, assuming all `_id`s are 24-char hex ObjectIds. Our app writes numeric (Long) ids into `_id`, so `WHERE _id = 1514` threw `invalid hexadecimal representation of an ObjectId: [1514]`. Added `coerceIdValue()` — convert to ObjectId only when `ObjectId.isValid()` is true, else pass the raw value through. Applied at all five `_id` conversion sites (eq, IN, NOT_IN, plan-based eq, plan-based $in/$nin). Reading `_id` always worked (surfaces as bigint); only filter pushdown was broken. |
+| `docdb: keep empty sub-documents as empty STRUCT, not VARCHAR` | `SchemaUtils.java` | Narrows the patch above. Downgrading *every* empty `Document` to VARCHAR also flattened sub-documents that are merely empty in the sampled rows but populated elsewhere, so those columns became unqueryable strings. Empty sub-documents now stay STRUCT and only genuinely childless structs are rewritten at the end. |
+| `docdb: keep arrays-of-sub-documents as LIST<STRUCT>, not LIST<VARCHAR>` | `SchemaUtils.java` | Same class of problem one level down: an array whose first sampled element was an empty document produced `array<varchar>`, hiding every field of the element type. |
+| `docdb: sample recently-updated documents as well, and make sampling configurable` | `SchemaUtils.java`, `DocDBMetadataHandler.java` | The base sample is an unsorted `find().limit(n)`: stable across cold starts, but it only ever reaches one fixed region of the collection, so a recently added field populated on a few active documents never appears (a recently added field existed on 9 of ~100k users and was missing). Adds a second slice over the most recently updated documents, unioned with the base slice, and moves the sizes into the environment — see below. |
 
 No SDK changes, no behaviour change for fields whose sub-shape is discoverable in the sample.
+
+### Sampling configuration
+
+Set on the connector Lambda's environment (in the infra repo, `athena/connectors/mongo-v2`). Defaults
+reproduce the pre-patch behaviour, so an unconfigured deployment behaves exactly as before.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `docdb_sample_base` | `3000` | Documents read in the unsorted base slice. Coverage here is *positional* and therefore permanent: once a document falls inside the window it stays inside it, so this is the lever for making a rare field permanently visible. |
+| `docdb_sample_recent` | `0` (off) | Documents read in the recency slice, sorted by `docdb_recency_field` descending. |
+| `docdb_recency_field` | unset | Field to sort the recency slice on, typically `updated_at`. |
+
+The recency slice is skipped unless the collection has an index whose **first key** is that field. That
+guard is deliberate: `user_searches` holds 1.6M documents and has no `updated_at`, and sorting it
+unindexed would push DocumentDB into an in-memory sort. It also makes the feature opt-in per collection
+without any per-collection configuration — if you want recency sampling somewhere, index the field.
+
+Production currently runs `3000` base + `2000` recent on `updated_at`. Against a collection of ~100k documents,
+seeing a few hundred updates a day, the recency slice reaches back roughly four days. Note the
+consequence: a field carried by only a few documents drops out of the schema once none of them has been
+touched for longer than that window, and returns when one is. If a column needs to be permanently
+present, raise `docdb_sample_base` rather than the recency size.
 
 ### Connector-adjacent fixes that live outside this fork
 
@@ -28,7 +53,7 @@ Two related issues were fixed in infrastructure config, not in connector code (d
 - **Connection-pool bounds** — the Lambda's DocumentDB connection string carries `maxPoolSize=10&maxIdleTimeMS=60000&maxConnecting=2&waitQueueTimeoutMS=10000` so idle connections (and their reserved cursor slots) are released promptly instead of lingering across warm invocations.
 - **Reserved concurrency = 12** — Athena fans one federated query into many parallel split invocations (observed 47-77 at once), each opening a cursor; capping concurrency keeps worst-case concurrent cursors under the t3.medium limit of 30.
 
-Both live in `infra/.../athena-prod-federated-query-v2/lambda-mongo/`. If the DocumentDB instance is ever scaled up (e.g. r5.large = 450 cursors), the concurrency cap can be raised or removed.
+Both live in `infra/infrastructure/production/eu-central-1/bah-production/athena/connectors/mongo-v2/`. The production DocumentDB is still `db.t3.medium`, so the cap still applies; if it is ever scaled up (e.g. `r5.large` = 450 cursors) the cap can be raised or removed.
 
 ## Branch model
 
@@ -54,30 +79,32 @@ The small, self-contained-patch design is what keeps rebases cheap.
 ```bash
 # Maven inside Docker (no local JDK required), then a single docker build that
 # bakes the resulting JAR into the runtime image, and pushes to our private ECR
-# repo at <old-account-id>.dkr.ecr.eu-central-1.amazonaws.com/athena-prod-mongo-connector-v2.
+# repo at <account-id>.dkr.ecr.eu-central-1.amazonaws.com/athena-prod-mongo-connector-v2.
 infra/scripts/build-mongo-connector.sh
 
-# Override the image tag (defaults to bah-fork-v1):
-IMAGE_TAG=bah-fork-v2 infra/scripts/build-mongo-connector.sh
+# Override the image tag:
+IMAGE_TAG=bah-fork-v7 infra/scripts/build-mongo-connector.sh
 ```
 
-We dropped GitHub Actions for this fork — the connector image is rebuilt only when one of the two patches changes, which is rare enough that maintaining org-wide CI secrets for a public fork wasn't worth the security exposure.
+We dropped GitHub Actions for this fork — the connector image is rebuilt only when one of the patches changes, which is rare enough that maintaining org-wide CI secrets for a public fork wasn't worth the security exposure.
+
+Tags in that ECR repository are **immutable**, so an existing tag cannot be rebuilt in place; bump `IMAGE_TAG` and tag the matching commit here (`git tag -a bah-fork-vN <commit>`) with the resulting image digest in the message. Old prod skipped that step once and the commit behind a running image had to be recovered from build timestamps.
 
 After pushing a new image, deploy via terragrunt in the infra repo:
 
 ```bash
-cd infra/infrastructure/staging/eu-central-1/bah-staging/athena-prod-federated-query-v2/lambda-mongo
-# If you bumped the image tag, update image_tag in terragrunt.hcl first.
-terragrunt apply
+cd infra/infrastructure/production/eu-central-1/bah-production/athena/connectors/mongo-v2
+# Update the tag in image_uri first.
+AWS_PROFILE=bah-prod terragrunt apply
 ```
 
-See `infra/athena-federated-query.md` §10 for the full apply order and rollback procedure.
+The unit uses the local `modules/athena-connector-image` module — a plain container-image Lambda plus its Athena data catalog registration. The stock SAR module (`modules/athena-connector`) cannot deploy a custom image and is what the MySQL connector still uses.
 
 ## Maintenance
 
 - **Upstream tracking**: check the [upstream changelog](https://github.com/awslabs/aws-athena-query-federation/releases) every few months. Rebase only when there's something we want (perf, bug fix, new MongoDB driver). The fork's value is small and stable; no point chasing every release.
 - **Build credentials**: `infra/scripts/build-mongo-connector.sh` uses your local AWS CLI session to push to ECR. No GitHub secrets needed.
-- **Rollback**: revert `lambda-mongo/terragrunt.hcl` to point at the previous image tag and `terragrunt apply`. ECR retains the last 10 tagged images, so any recent tag is recoverable. Worst-case full rollback: `git log -- infra/.../lambda-mongo/main.tf` has the SAR-based main.tf one revert away.
+- **Rollback**: point `image_uri` at the previous tag and apply. ECR keeps the last 10 images, so any recent tag is recoverable. Sampling changes need no rebuild at all — the sizes are environment variables, so a slow cold start can be tuned down by editing the unit and applying.
 
 ## Contact
 
