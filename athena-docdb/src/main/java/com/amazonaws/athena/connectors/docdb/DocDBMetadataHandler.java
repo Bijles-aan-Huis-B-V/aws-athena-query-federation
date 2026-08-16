@@ -113,6 +113,15 @@ public class DocDBMetadataHandler
     // BAH fork: raised from 10 to 3000 to make schema inference deterministic
     // and avoid empty-struct TYPE_NOT_FOUND failures from unlucky sampling.
     private static final int SCHEMA_INFERRENCE_NUM_DOCS = 3000;
+    // BAH fork: the unsorted base slice only ever reaches one fixed region of a collection, so a field
+    // added recently and populated on a few active documents never shows up. These make the sample size
+    // and an additional "most recently updated" slice configurable at runtime, so tuning them does not
+    // require rebuilding the image — which is what forced this fork in the first place.
+    private static final String SAMPLE_DOCS_ENV = "docdb_sample_base";
+    private static final String SAMPLE_RECENT_DOCS_ENV = "docdb_sample_recent";
+    private static final String RECENCY_FIELD_ENV = "docdb_recency_field";
+    // Defaults keep the pre-existing behaviour when nothing is configured.
+    private static final int DEFAULT_SCHEMA_INFERRENCE_RECENT_NUM_DOCS = 0;
     // used to filter out Glue databases which lack the docdb-metadata-flag in the URI.
     private static final DatabaseFilter DB_FILTER = (Database database) -> (database.locationUri() != null && database.locationUri().contains(DOCDB_METADATA_FLAG));
 
@@ -382,7 +391,10 @@ public class DocDBMetadataHandler
             MongoDatabase db = client.getDatabase(schemaNameInput);
             tableNameInput = DocDBCaseInsensitiveResolver.getTableNameCaseInsensitiveMatch(configOptions, db, tableNameInput);
             tableName = new TableName(schemaNameInput, tableNameInput);
-            schema = SchemaUtils.inferSchema(db, tableName, SCHEMA_INFERRENCE_NUM_DOCS);
+            schema = SchemaUtils.inferSchema(db, tableName,
+                    configuredInt(SAMPLE_DOCS_ENV, SCHEMA_INFERRENCE_NUM_DOCS),
+                    configuredInt(SAMPLE_RECENT_DOCS_ENV, DEFAULT_SCHEMA_INFERRENCE_RECENT_NUM_DOCS),
+                    configOptions.get(RECENCY_FIELD_ENV));
         }
         return new GetTableResponse(request.getCatalogName(), tableName, schema);
     }
@@ -516,5 +528,25 @@ public class DocDBMetadataHandler
             connStr += "?" + jdbcParams;
         }
         return connStr;
+    }
+
+    /**
+     * BAH fork: reads an integer tuning knob from the Lambda environment, falling back to the default
+     * when it is unset or unparseable. A bad value must not take schema inference down, so it is logged
+     * and ignored rather than thrown.
+     */
+    private int configuredInt(String key, int defaultValue)
+    {
+        String raw = configOptions.get(key);
+        if (raw == null || raw.trim().isEmpty()) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        }
+        catch (NumberFormatException ex) {
+            logger.warn("configuredInt: ignoring unparseable value[{}] for[{}], using default[{}].", raw, key, defaultValue);
+            return defaultValue;
+        }
     }
 }

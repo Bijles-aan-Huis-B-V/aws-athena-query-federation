@@ -72,47 +72,61 @@ public class SchemaUtils
      */
     public static Schema inferSchema(MongoDatabase db, TableName table, int numObjToSample)
     {
-        int docCount = 0;
-        int fieldCount = 0;
-        try (MongoCursor<Document> docs = db.getCollection(table.getTableName()).find().batchSize(numObjToSample)
-                .limit(numObjToSample).iterator()) {
-            if (!docs.hasNext()) {
-                return SchemaBuilder.newBuilder().build();
-            }
-            SchemaBuilder schemaBuilder = SchemaBuilder.newBuilder();
+        return inferSchema(db, table, numObjToSample, 0, null);
+    }
 
-            while (docs.hasNext()) {
-                docCount++;
-                Document doc = docs.next();
-                for (String key : doc.keySet()) {
-                    fieldCount++;
-                    Field newField = getArrowField(key, doc.get(key));
-                    Types.MinorType newType = Types.getMinorTypeForArrowType(newField.getType());
-                    Field curField = schemaBuilder.getField(key);
-                    Types.MinorType curType = (curField != null) ? Types.getMinorTypeForArrowType(curField.getType()) : null;
+    /**
+     * BAH fork: samples the collection in two slices and unions the result.
+     * <p>
+     * The base slice is the unsorted scan the upstream connector has always used. It returns the same
+     * documents on every cold start, which keeps the schema stable, but it only ever sees one fixed
+     * region of the collection — so a field introduced recently and populated on a handful of active
+     * documents is invisible no matter how large the slice gets.
+     * <p>
+     * The recency slice closes that gap by taking the most recently updated documents. It is only used
+     * when recencyField is set and the collection carries an index whose first key is that field:
+     * sorting a large collection on an unindexed field would push DocumentDB into an in-memory sort.
+     * Requiring the index also keeps the behaviour opt-in per collection without extra configuration.
+     *
+     * @param numObjToSample Documents to read in the unsorted base slice.
+     * @param numRecentObjToSample Documents to read in the recency slice; 0 disables it.
+     * @param recencyField Field to sort the recency slice on, descending; null disables it.
+     */
+    public static Schema inferSchema(MongoDatabase db, TableName table, int numObjToSample,
+            int numRecentObjToSample, String recencyField)
+    {
+        SchemaBuilder schemaBuilder = SchemaBuilder.newBuilder();
+        int[] counts = new int[] {0, 0};
 
-                    if (curField == null) {
-                        schemaBuilder.addField(newField);
-                    }
-                    else if (newType != curType) {
-                        //TODO: currently we resolve fields with mixed types by defaulting to VARCHAR. This is _not_ ideal
-                        logger.warn("inferSchema: Encountered a mixed-type field[{}] {} vs {}, defaulting to String.",
-                                key, curType, newType);
-                        schemaBuilder.addStringField(key);
-                    }
-                    else if (curType == Types.MinorType.LIST) {
-                        schemaBuilder.addField(mergeListField(key, curField, newField));
-                    }
-                    else if (curType == Types.MinorType.STRUCT) {
-                        schemaBuilder.addField(mergeStructField(key, curField, newField));
-                    }
+        boolean useRecency = numRecentObjToSample > 0 && recencyField != null && !recencyField.isEmpty()
+                && hasIndexOn(db, table.getTableName(), recencyField);
+        if (numRecentObjToSample > 0 && !useRecency) {
+            logger.info("inferSchema: recency slice skipped for table[{}] — recencyField[{}] is unset or not indexed.",
+                    table.getTableName(), recencyField);
+        }
+
+        try {
+            if (useRecency) {
+                try (MongoCursor<Document> docs = db.getCollection(table.getTableName()).find()
+                        .sort(new Document(recencyField, -1))
+                        .batchSize(numRecentObjToSample).limit(numRecentObjToSample).iterator()) {
+                    mergeDocuments(docs, schemaBuilder, counts);
                 }
+            }
+
+            try (MongoCursor<Document> docs = db.getCollection(table.getTableName()).find()
+                    .batchSize(numObjToSample).limit(numObjToSample).iterator()) {
+                mergeDocuments(docs, schemaBuilder, counts);
+            }
+
+            if (counts[0] == 0) {
+                return SchemaBuilder.newBuilder().build();
             }
 
             Schema schema = schemaBuilder.build();
             if (schema.getFields().isEmpty()) {
-                throw new RuntimeException("No columns found after scanning " + fieldCount + " values across " +
-                        docCount + " documents. Please ensure the collection is not empty and contains at least 1 supported column type.");
+                throw new RuntimeException("No columns found after scanning " + counts[1] + " values across " +
+                        counts[0] + " documents. Please ensure the collection is not empty and contains at least 1 supported column type.");
             }
             // BAH fork: belt-and-suspenders pass — any STRUCT that ended up with no children
             // (e.g. produced via mergeStructField from two empty parents) is rewritten to VARCHAR
@@ -120,8 +134,71 @@ public class SchemaUtils
             return sanitizeEmptyStructs(schema);
         }
         finally {
-            logger.info("inferSchema: Evaluated {} field values across {} documents.", fieldCount, docCount);
+            logger.info("inferSchema: Evaluated {} field values across {} documents (recency slice {}).",
+                    counts[1], counts[0], useRecency ? "on: " + recencyField : "off");
         }
+    }
+
+    /**
+     * BAH fork: folds every document the cursor yields into schemaBuilder, tracking documents in
+     * counts[0] and field values in counts[1]. Extracted so the base and recency slices share one
+     * union implementation; re-visiting a document present in both slices is harmless, since the merge
+     * is idempotent for identical field types.
+     */
+    private static void mergeDocuments(MongoCursor<Document> docs, SchemaBuilder schemaBuilder, int[] counts)
+    {
+        while (docs.hasNext()) {
+            counts[0]++;
+            Document doc = docs.next();
+            for (String key : doc.keySet()) {
+                counts[1]++;
+                Field newField = getArrowField(key, doc.get(key));
+                Types.MinorType newType = Types.getMinorTypeForArrowType(newField.getType());
+                Field curField = schemaBuilder.getField(key);
+                Types.MinorType curType = (curField != null) ? Types.getMinorTypeForArrowType(curField.getType()) : null;
+
+                if (curField == null) {
+                    schemaBuilder.addField(newField);
+                }
+                else if (newType != curType) {
+                    //TODO: currently we resolve fields with mixed types by defaulting to VARCHAR. This is _not_ ideal
+                    logger.warn("inferSchema: Encountered a mixed-type field[{}] {} vs {}, defaulting to String.",
+                            key, curType, newType);
+                    schemaBuilder.addStringField(key);
+                }
+                else if (curType == Types.MinorType.LIST) {
+                    schemaBuilder.addField(mergeListField(key, curField, newField));
+                }
+                else if (curType == Types.MinorType.STRUCT) {
+                    schemaBuilder.addField(mergeStructField(key, curField, newField));
+                }
+            }
+        }
+    }
+
+    /**
+     * BAH fork: true when the collection has an index whose first key is fieldName, so the recency
+     * slice can sort on it without DocumentDB falling back to an in-memory sort. Failures are treated
+     * as "no index" — losing the recency slice is preferable to failing schema inference outright.
+     */
+    private static boolean hasIndexOn(MongoDatabase db, String collection, String fieldName)
+    {
+        try {
+            for (Document index : db.getCollection(collection).listIndexes()) {
+                Object key = index.get("key");
+                if (key instanceof Document) {
+                    java.util.Iterator<String> keys = ((Document) key).keySet().iterator();
+                    if (keys.hasNext() && fieldName.equals(keys.next())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (RuntimeException ex) {
+            logger.warn("hasIndexOn: could not list indexes for collection[{}], assuming no index on[{}].",
+                    collection, fieldName, ex);
+        }
+        return false;
     }
 
     /**
