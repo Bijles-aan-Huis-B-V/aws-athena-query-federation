@@ -74,16 +74,16 @@ The small, self-contained-patch design is what keeps rebases cheap.
 
 ## Build / deploy
 
-**No CI in this fork.** Builds are run manually from a developer machine using the script in the infra repo:
+**No CI in this fork.** Builds are run manually from a developer machine using the script at the root of this repo:
 
 ```bash
 # Maven inside Docker (no local JDK required), then a single docker build that
 # bakes the resulting JAR into the runtime image, and pushes to our private ECR
 # repo at <account-id>.dkr.ecr.eu-central-1.amazonaws.com/athena-prod-mongo-connector-v2.
-infra/scripts/build-mongo-connector.sh
+./build-connector.sh
 
 # Override the image tag:
-IMAGE_TAG=bah-fork-v7 infra/scripts/build-mongo-connector.sh
+IMAGE_TAG=bah-fork-v7 ./build-connector.sh
 ```
 
 We dropped GitHub Actions for this fork — the connector image is rebuilt only when one of the patches changes, which is rare enough that maintaining org-wide CI secrets for a public fork wasn't worth the security exposure.
@@ -103,7 +103,7 @@ The unit uses the local `modules/athena-connector-image` module — a plain cont
 ## Maintenance
 
 - **Upstream tracking**: check the [upstream changelog](https://github.com/awslabs/aws-athena-query-federation/releases) every few months. Rebase only when there's something we want (perf, bug fix, new MongoDB driver). The fork's value is small and stable; no point chasing every release.
-- **Build credentials**: `infra/scripts/build-mongo-connector.sh` uses your local AWS CLI session to push to ECR. No GitHub secrets needed.
+- **Build credentials**: `./build-connector.sh` uses your local AWS CLI session to push to ECR. No GitHub secrets needed.
 - **Rollback**: point `image_uri` at the previous tag and apply. ECR keeps the last 10 images, so any recent tag is recoverable. Sampling changes need no rebuild at all — the sizes are environment variables, so a slow cold start can be tuned down by editing the unit and applying.
 
 ## Contact
