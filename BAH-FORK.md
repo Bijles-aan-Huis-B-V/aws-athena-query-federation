@@ -20,7 +20,7 @@ Seven commits on the [`bah-fork`](https://github.com/Bijles-aan-Huis-B-V/aws-ath
 | `docdb: only coerce _id filter values to ObjectId when actually an ObjectId` | `QueryUtils.java` | Upstream wraps **every** `_id` filter value in `new ObjectId(...)`, assuming all `_id`s are 24-char hex ObjectIds. Our app writes numeric (Long) ids into `_id`, so `WHERE _id = 1514` threw `invalid hexadecimal representation of an ObjectId: [1514]`. Added `coerceIdValue()` — convert to ObjectId only when `ObjectId.isValid()` is true, else pass the raw value through. Applied at all five `_id` conversion sites (eq, IN, NOT_IN, plan-based eq, plan-based $in/$nin). Reading `_id` always worked (surfaces as bigint); only filter pushdown was broken. |
 | `docdb: keep empty sub-documents as empty STRUCT, not VARCHAR` | `SchemaUtils.java` | Narrows the patch above. Downgrading *every* empty `Document` to VARCHAR also flattened sub-documents that are merely empty in the sampled rows but populated elsewhere, so those columns became unqueryable strings. Empty sub-documents now stay STRUCT and only genuinely childless structs are rewritten at the end. |
 | `docdb: keep arrays-of-sub-documents as LIST<STRUCT>, not LIST<VARCHAR>` | `SchemaUtils.java` | Same class of problem one level down: an array whose first sampled element was an empty document produced `array<varchar>`, hiding every field of the element type. |
-| `docdb: sample recently-updated documents as well, and make sampling configurable` | `SchemaUtils.java`, `DocDBMetadataHandler.java` | The base sample is an unsorted `find().limit(n)`: stable across cold starts, but it only ever reaches one fixed region of the collection, so a recently added field populated on a few active documents never appears (a recently added field existed on 9 of ~100k users and was missing). Adds a second slice over the most recently updated documents, unioned with the base slice, and moves the sizes into the environment — see below. |
+| `docdb: sample recently-updated documents as well, and make sampling configurable` | `SchemaUtils.java`, `DocDBMetadataHandler.java` | The base sample is an unsorted `find().limit(n)`: stable across cold starts, but it only ever reaches one fixed region of the collection, so a recently added field populated on a few active documents never appears (a field present on a handful of documents out of ~100k was missing from the schema). Adds a second slice over the most recently updated documents, unioned with the base slice, and moves the sizes into the environment — see below. |
 
 No SDK changes, no behaviour change for fields whose sub-shape is discoverable in the sample.
 
@@ -40,8 +40,8 @@ guard is deliberate: `user_searches` holds 1.6M documents and has no `updated_at
 unindexed would push DocumentDB into an in-memory sort. It also makes the feature opt-in per collection
 without any per-collection configuration — if you want recency sampling somewhere, index the field.
 
-Production currently runs `3000` base + `2000` recent on `updated_at`. Against a collection of ~100k documents,
-seeing a few hundred updates a day, the recency slice reaches back roughly four days. Note the
+Production currently runs `3000` base + `2000` recent on `updated_at`. Against a collection of ~100k
+documents seeing a few hundred updates a day, the recency slice reaches back roughly four days. Note the
 consequence: a field carried by only a few documents drops out of the schema once none of them has been
 touched for longer than that window, and returns when one is. If a column needs to be permanently
 present, raise `docdb_sample_base` rather than the recency size.
@@ -53,7 +53,7 @@ Two related issues were fixed in infrastructure config, not in connector code (d
 - **Connection-pool bounds** — the Lambda's DocumentDB connection string carries `maxPoolSize=10&maxIdleTimeMS=60000&maxConnecting=2&waitQueueTimeoutMS=10000` so idle connections (and their reserved cursor slots) are released promptly instead of lingering across warm invocations.
 - **Reserved concurrency = 12** — Athena fans one federated query into many parallel split invocations (observed 47-77 at once), each opening a cursor; capping concurrency keeps worst-case concurrent cursors under the t3.medium limit of 30.
 
-Both live in `infra/infrastructure/production/eu-central-1/bah-production/athena/connectors/mongo-v2/`. The production DocumentDB is still `db.t3.medium`, so the cap still applies; if it is ever scaled up (e.g. `r5.large` = 450 cursors) the cap can be raised or removed.
+Both live in the infra repo, on the connector's terragrunt unit. The instance class the cap is sized for allows 30 cursors; if it is ever scaled up (a class allowing 450, say) the cap can be raised or removed.
 
 ## Branch model
 
@@ -79,7 +79,7 @@ The small, self-contained-patch design is what keeps rebases cheap.
 ```bash
 # Maven inside Docker (no local JDK required), then a single docker build that
 # bakes the resulting JAR into the runtime image, and pushes to our private ECR
-# repo at <account-id>.dkr.ecr.eu-central-1.amazonaws.com/athena-prod-mongo-connector-v2.
+# repo (set AWS_ACCOUNT_ID; see the script header).
 ./build-connector.sh
 
 # Override the image tag:
@@ -93,9 +93,9 @@ Tags in that ECR repository are **immutable**, so an existing tag cannot be rebu
 After pushing a new image, deploy via terragrunt in the infra repo:
 
 ```bash
-cd infra/infrastructure/production/eu-central-1/bah-production/athena/connectors/mongo-v2
+cd <infra>/…/athena/connectors/mongo-v2   # the connector's terragrunt unit
 # Update the tag in image_uri first.
-AWS_PROFILE=bah-prod terragrunt apply
+terragrunt apply
 ```
 
 The unit uses the local `modules/athena-connector-image` module — a plain container-image Lambda plus its Athena data catalog registration. The stock SAR module (`modules/athena-connector`) cannot deploy a custom image and is what the MySQL connector still uses.

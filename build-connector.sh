@@ -8,8 +8,8 @@
 # Prerequisites:
 #   - Docker daemon running (used both for the Maven build and the connector image).
 #     No local JDK or Maven needed; both run in containers.
-#   - AWS CLI authenticated against the production account <account-id> (eu-central-1) with
-#     permission to push to the ECR repo athena-prod-mongo-connector-v2. Use AWS_PROFILE=bah-prod.
+#   - AWS CLI authenticated against the target AWS account (eu-central-1) with permission to push to
+#     the connector's ECR repo. Set AWS_ACCOUNT_ID, and AWS_PROFILE if it is not your default.
 #   - The ecr/athena-prod-mongo-connector-v2 terragrunt unit must already be applied.
 #     Tags in that repo are immutable, so a tag can never be rebuilt in place — bump IMAGE_TAG.
 #
@@ -20,11 +20,11 @@
 #   3. Logs in to ECR, tags the image, pushes.
 #
 # Usage:
-#   AWS_PROFILE=bah-prod ./build-connector.sh                     # tag: bah-fork-v6
-#   AWS_PROFILE=bah-prod IMAGE_TAG=bah-fork-v7 ./build-connector.sh
+#   AWS_ACCOUNT_ID=... ./build-connector.sh                       # tag: bah-fork-v6
+#   AWS_ACCOUNT_ID=... IMAGE_TAG=bah-fork-v7 ./build-connector.sh
 #
-# Afterwards, in the infra repo, set the new tag in the image_uri of
-# infrastructure/production/eu-central-1/bah-production/athena/connectors/mongo-v2 and apply. Then tag
+# Afterwards, in the infra repo, set the new tag in the image_uri of the connector's terragrunt unit
+# and apply. Then tag
 # the commit here (git tag -a bah-fork-vN) with the image digest in the message, so the running image
 # can always be traced back to source.
 #
@@ -33,7 +33,8 @@ set -euo pipefail
 # ---- config -----------------------------------------------------------------
 
 AWS_REGION="${AWS_REGION:-eu-central-1}"
-AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-<account-id>}"
+# Deliberately has no default: this is a public repo, and the account is not published here.
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:?set AWS_ACCOUNT_ID to the account holding the ECR repo}"
 ECR_REPO_NAME="${ECR_REPO_NAME:-athena-prod-mongo-connector-v2}"
 IMAGE_TAG="${IMAGE_TAG:-bah-fork-v6}"
 
